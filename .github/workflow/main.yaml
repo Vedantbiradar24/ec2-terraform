@@ -1,0 +1,98 @@
+name: Terraform
+
+# Ye workflow 2 tareeke se trigger ho sakta hai:
+# 1. Automatic - jab bhi 'main' branch pe push hoga
+# 2. Manual - GitHub Actions tab se "Run workflow" dabake, jisme tum
+#    dropdown se action (plan/apply/none) aur environment (dev/int/stg/prod) choose kar sakte ho
+on:
+  push:
+    branches: 'main'
+  workflow_dispatch:
+    inputs:
+      terraform_action:
+        description: "Select Terraform action"
+        required: true
+        default: "none"
+        type: choice
+        options:
+          - none      # kuch bhi plan/apply nahi hoga, sirf validate tak rukega
+          - plan
+          - apply
+      enviroment: 
+        description: choice env name 
+        default: dev
+        type: choice
+        options:
+          - dev
+          - int
+          - stg
+          - prod
+
+# Global env variables - poore workflow me kahin bhi ${{ env.xyz }} se access honge
+env:
+  # Agar manual trigger (workflow_dispatch) hua to dropdown wali value use hogi,
+  # warna (jaise push trigger ke case me) default 'dev' fallback ho jayega
+  enviroment: "${{ github.event.inputs.enviroment || 'dev' }}"
+  # Same logic - agar dropdown se action nahi mila (push trigger case) to default 'plan' fallback
+  terraform-action: "${{ github.event.inputs.terraform_action || 'plan' }}"
+
+jobs:
+  terraform:
+    name: Terraform
+    runs-on: ubuntu-latest
+    steps:
+      # 1. Checkout - repo ka code runner machine pe copy/clone karta hai
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2. Install / Setup Terraform - Terraform CLI ko runner pe install karta hai
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      # 3. Configure AWS credentials - GitHub Secrets se AWS keys leke
+      #    AWS session set karta hai taaki Terraform AWS pe resources bana sake
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # Backend configure karna - backend.tf file me placeholders (<bucket_name>,
+      # <key_name>, <region_name>) ko sed command se actual values se replace kar rahe hain.
+      # Key path environment-wise alag hoga: e.g. dev/owner/repo.tfstate
+      # Isse har environment (dev/int/stg/prod) ka state file S3 me separate rahega
+      - name: configure s3 backend
+        run: |
+            sed -i 's|<bucket_name>|aws-infra-qt-devops|g' backend.tf
+            sed -i 's|<key_name>|${{ env.enviroment }}/${{ github.repository }}.tfstate|g' backend.tf
+            sed -i 's|<region_name>|us-east-1|g' backend.tf
+
+      # 4. Terraform Init - backend (S3) aur providers ko initialize karta hai
+      - name: Terraform Init
+        run: terraform init
+
+      # 5. Terraform Format - code ko standard Terraform style me format karta hai
+      # Note: bina '-check' flag ke ye file ko khud modify/fix kar dega (fail nahi karega)
+      - name: Terraform Format
+        run: terraform fmt
+
+      # 6. Terraform Validate - config syntactically valid hai ya nahi check karta hai
+      - name: Terraform Validate
+        run: terraform validate
+
+      # 7. Terraform Plan - changes ka preview dikhata hai (kya create/update/delete hoga)
+      # Note: 'if' condition comment out hai, isliye ye step HAMESHA chalega,
+      #       chahe action 'none', 'plan', ya 'apply' kuch bhi ho
+      - name: Terraform Plan
+        # if: ${{ env.terraform-action == 'plan' || inputs.terraform_action == 'apply' }}
+        run: terraform plan
+
+      # 8. Terraform Apply - actual resources create/update/delete karta hai
+      # Sirf tab chalega jab:
+      #   - dropdown se action = 'apply' select kiya ho, AND
+      #   - trigger manual (workflow_dispatch) ho (push se apply kabhi nahi chalega)
+      # '-auto-approve' isliye kyunki CI me interactive "yes" confirm nahi de sakte
+      - name: Terraform Apply
+        if: ${{ env.terraform-action == 'apply' && github.event_name == 'workflow_dispatch' }}
+        run: terraform apply -auto-approve
